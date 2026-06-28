@@ -70,7 +70,10 @@
  * NOT MODELLED
  * ------------
  * I-cache, D-cache, DDR/BRAM wait states, PLB/AXI bus, branch prediction,
- * taken/not-taken penalties, interrupts, DMA, timer effects.
+ * interrupts, DMA, timer effects.
+ * Branch taken/not-taken penalties ARE modelled: non-D conditional = 1 cycle
+ * (not taken) or 3 cycles (taken); non-D unconditional = 3 cycles always;
+ * D-form = 1 cycle (delay slot counted separately at its own cost).
  */
 
 #include <inttypes.h>
@@ -208,6 +211,7 @@ static const uint8_t mb_class[64] = {
     CLS_LOAD,CLS_LOAD,CLS_LOAD,CLS_OTHER,CLS_STORE,CLS_STORE,CLS_STORE,CLS_OTHER,
 };
 
+
 /* =========================================================================
  * Counter block — used for totals, snapshot, and bench delta
  * ========================================================================= */
@@ -236,15 +240,35 @@ static uint64_t trans_count;
 static uint64_t *op_class_ctr[64];
 
 /* =========================================================================
- * Stall model state
+ * Cross-TB stall state
+ * =========================================================================
+ * If the last instruction of TB[N] is a load/mfs (result latency 2), and
+ * the first instruction of TB[N+1] reads the written register, there is a
+ * 1-cycle load-use stall.  We cannot detect this at translation time since
+ * we do not know which TB follows which.  We carry the loaded register Rd
+ * here; vcpu_tb_exec_branch checks it against first_insn_reads at the start
+ * of each TB execution.
  * ========================================================================= */
-static uint64_t reg_ready[32];
-static uint64_t pipeline_cycle;
+static uint8_t g_cross_tb_stall_rd;   /* 0 = no pending cross-TB stall */
+
+/* =========================================================================
+ * Retroactive branch-taken accounting
+ * =========================================================================
+ * When a non-D conditional branch ends a TB we cannot know at translation
+ * time whether it will be taken.  We save the fallthrough PC here; at the
+ * start of the NEXT TB's exec callback, if next_tb_vaddr != fallthrough_pc
+ * the branch was taken and we add 2 extra cycles to total.wcycles.
+ * ========================================================================= */
+typedef struct {
+    bool     valid;
+    uint64_t fallthrough_pc;
+} PendingBranch;
+
+static PendingBranch g_pending_branch;
 
 /* =========================================================================
  * Plugin configuration
  * ========================================================================= */
-static bool model_stalls;
 static bool verbose;
 static bool big_endian_target;
 
@@ -287,18 +311,102 @@ static inline bool is_bench_magic(uint32_t w)
         && (w & MB_MAGIC_MASK)  == MB_MAGIC_BYTE;
 }
 
-/* Return true if this is a delayed-branch (D-form) opcode. */
+/*
+ * Return true if this is a delayed-branch (D-form) opcode.
+ *
+ * Encoding verified against insns.decode:
+ *   0x26 (br/brd/brald):  Ra-field bits[20:16] encode D/A/L; D = bit 20
+ *   0x27 (beq/beqd etc.): Rd-field bits[25:21] encode cond+D; D = bit 25 (MSB of rD)
+ *   0x2D (rtsd etc.):     always has a delay slot
+ *   0x2E (bri/brid etc.): same layout as 0x26; D = bit 20
+ *   0x2F (beqi/beqid):    same layout as 0x27; D = bit 25 (MSB of rD)
+ */
 static inline bool is_delayed_branch(uint32_t w)
 {
     uint8_t op = (w >> 26) & 0x3F;
     switch (op) {
-    case 0x26: return (w >>  8) & 1;   /* brd/brad/brld/brald */
-    case 0x27: return (w >> 20) & 1;   /* beqd-bged */
-    case 0x2D: return true;            /* rtsd/rtid/rtbd/rted always have delay slot */
-    case 0x2E: return (w >>  8) & 1;   /* brid/braid/brlid/bralid */
-    case 0x2F: return (w >> 20) & 1;   /* beqid-bgeid */
+    case 0x26: return (w >> 20) & 1;   /* brd/brad/brld/brald: D at bit 20 */
+    case 0x27: return (w >> 25) & 1;   /* beqd-bged: D at bit 25 (MSB of rD) */
+    case 0x2D: return true;            /* rtsd/rtid/rtbd/rted: always       */
+    case 0x2E: return (w >> 20) & 1;   /* brid/braid/brlid/bralid: D at 20 */
+    case 0x2F: return (w >> 25) & 1;   /* beqid-bgeid: D at bit 25 (MSB of rD) */
     default:   return false;
     }
+}
+
+/* Conditional branch opcodes: 0x27 (beq/bne/… register) and 0x2F (imm form). */
+static inline bool is_cond_branch_op(uint8_t op)
+{
+    return op == 0x27 || op == 0x2F;
+}
+
+/*
+ * Static load-use stall helpers.
+ *
+ * Returns the GPR written by this instruction if it has a 2-cycle result
+ * latency (loads, mfs).  Returns 0 if no hazard is possible (r0 is always
+ * 0 so writing it never stalls a consumer).
+ */
+static inline uint8_t stall_source_rd(uint32_t w)
+{
+    uint8_t op = (w >> 26) & 0x3F;
+    if (mb_result_latency[op] < 2)
+        return 0;
+    return (w >> 21) & 0x1F;   /* Rd; 0 means r0, never a hazard */
+}
+
+/*
+ * Returns true if instruction w reads GPR r (r != 0).
+ * Checks Ra, Rb (Type-A only), and Rd-as-source (stores/conditional branches).
+ */
+static inline bool insn_reads_reg(uint32_t w, uint8_t r)
+{
+    if (!r) return false;
+    uint8_t op = (w >> 26) & 0x3F;
+    if (((w >> 16) & 0x1F) == r) return true;              /* Ra */
+    if (!(op & 8) && ((w >> 11) & 0x1F) == r) return true; /* Rb (Type-A) */
+    if (mb_rd_is_src[op] && ((w >> 21) & 0x1F) == r) return true; /* Rd-src */
+    return false;
+}
+
+/* Bitmask of all GPRs read by instruction w (bits 1–31; bit 0 always clear). */
+static inline uint32_t insn_reads_mask(uint32_t w)
+{
+    uint32_t m = 0;
+    uint8_t op = (w >> 26) & 0x3F;
+    uint8_t ra = (w >> 16) & 0x1F; if (ra) m |= 1u << ra;
+    if (!(op & 8)) { uint8_t rb = (w >> 11) & 0x1F; if (rb) m |= 1u << rb; }
+    if (mb_rd_is_src[op]) { uint8_t rd = (w >> 21) & 0x1F; if (rd) m |= 1u << rd; }
+    return m;
+}
+
+/*
+ * Static cycle cost for a branch instruction.
+ *
+ * Per UG984 §5 branch latency table:
+ *   not taken:              1 cycle
+ *   taken + D-bit set:      2 cycles (branch + delay slot, no flush)
+ *   taken + D-bit not set:  3 cycles (branch + 2-cycle pipeline flush)
+ *
+ * D-form (D-bit set): cost = 1.  Delay slot always executes regardless of
+ * taken/not-taken and is counted separately.  Total = 1 + delay_slot_cost.
+ *
+ * Non-D unconditional (bri, bra, bral, brl and register forms): always
+ * taken → cost = 3 (1 branch + 2-cycle flush).
+ *
+ * Non-D conditional (bnei, beqi, blti, …): static cost = 1.  An extra 2
+ * cycles is credited retroactively when the next TB's start address does not
+ * equal this branch's fallthrough PC (i.e. it was taken).  Not-taken → 1
+ * cycle total; taken → 3 cycles total.  Accounting is done in
+ * vcpu_tb_exec_branch (stalls=off) / vcpu_tb_exec_stall (stalls=on).
+ */
+static inline uint8_t mb_branch_cost(uint32_t w)
+{
+    if (is_delayed_branch(w))
+        return 1;
+    if (is_cond_branch_op((w >> 26) & 0x3F))
+        return 1;   /* +2 added retroactively on taken path */
+    return 3;       /* unconditional non-D: always taken, 3-cycle flush */
 }
 
 static inline uint64_t stall_for(uint8_t r, uint64_t now)
@@ -424,107 +532,102 @@ static void vcpu_insn_exec_bench(unsigned int vcpu_idx, void *userdata)
     }
 }
 
-/*
- * RAW-stall callback for normal instructions (stalls=on).
- *
- * Packed metadata in userdata (uintptr_t, 64-bit host):
- *   bits [ 5: 0]  op          6-bit opcode
- *   bits [10: 6]  rd          bits[25:21]
- *   bits [15:11]  ra          bits[20:16]
- *   bits [20:16]  rb          bits[15:11]
- *   bit  [21]     type_b      1 = no Rb field
- *   bit  [22]     rd_is_src   1 = rd is also a source
- *   bit  [23]     valid       1 = instruction bytes were available
- *   bits [31:24]  base_cyc    pre-computed weighted cost
- *   bit  [32]     is_nop      1 = canonical NOP word
- */
-static void vcpu_insn_exec_stall(unsigned int vcpu_idx, void *userdata)
-{
-    uintptr_t meta   = (uintptr_t)userdata;
-    uint8_t op       = (meta >>  0) & 0x3F;
-    uint8_t rd       = (meta >>  6) & 0x1F;
-    uint8_t ra       = (meta >> 11) & 0x1F;
-    uint8_t rb       = (meta >> 16) & 0x1F;
-    bool    type_b   = (meta >> 21) & 1;
-    bool    rd_src   = (meta >> 22) & 1;
-    bool    valid    = (meta >> 23) & 1;
-    uint64_t base    = (meta >> 24) & 0xFF;
-    bool    is_nop   = (meta >> 32) & 1;
+/* =========================================================================
+ * TB-exec callback — branch accounting and cross-TB stall resolution
+ * ========================================================================= */
+typedef struct {
+    uint64_t tb_vaddr;
+    bool     has_cond_branch;
+    uint64_t fallthrough_pc;
+    uint8_t  last_stall_rd;     /* Rd of last stall-source insn in TB (0 = none) */
+    uint32_t first_insn_reads;  /* bitmask of GPRs read by TB's first real insn */
+} TBBranchMeta;
 
-    uint64_t stall = 0;
-    if (valid) {
-        uint64_t now = pipeline_cycle;
-        uint64_t s;
-        s = stall_for(ra, now); if (s > stall) stall = s;
-        if (!type_b) { s = stall_for(rb, now); if (s > stall) stall = s; }
-        if (rd_src)  { s = stall_for(rd, now); if (s > stall) stall = s; }
+static void vcpu_tb_exec_branch(unsigned int vcpu_idx, void *userdata)
+{
+    const TBBranchMeta *info = (const TBBranchMeta *)userdata;
+
+    /* Cross-TB load-use stall: previous TB ended with a stall-source insn. */
+    if (g_cross_tb_stall_rd &&
+        (info->first_insn_reads >> g_cross_tb_stall_rd) & 1)
+        total.scycles += 1;
+    g_cross_tb_stall_rd = info->last_stall_rd;
+
+    /* Retroactive branch-taken credit. */
+    if (g_pending_branch.valid) {
+        if (info->tb_vaddr != g_pending_branch.fallthrough_pc)
+            total.wcycles += 2;   /* taken: 1 static + 2 extra = 3 total */
+        g_pending_branch.valid = false;
     }
 
-    uint64_t issue  = pipeline_cycle + stall;
-    pipeline_cycle  = issue + base;
-
-    uint8_t lat = (op == 0x16) ? (uint8_t)base : mb_result_latency[op];
-    if (lat && rd)
-        reg_ready[rd] = issue + lat;
-
-    total.insns++;
-    total.wcycles += base;
-    total.scycles += stall;
-    total.op_count[op]++;
-    total.op_cycles[op] += base + stall;
-
-    if (is_nop) {
-        total.nop++;
-    } else if (op_class_ctr[op]) {
-        (*op_class_ctr[op])++;
+    if (info->has_cond_branch) {
+        g_pending_branch.valid          = true;
+        g_pending_branch.fallthrough_pc = info->fallthrough_pc;
     }
 }
 
 /* =========================================================================
  * TB translation callback
+ * =========================================================================
+ * One path only: inline counter updates per instruction.  Load-use stalls
+ * are detected statically by looking at adjacent instruction pairs; the
+ * stall penalty is baked in as a constant inline add at translation time.
+ * Branch taken/not-taken and cross-TB stall resolution are handled by one
+ * lightweight C callback per TB (vcpu_tb_exec_branch).
  * ========================================================================= */
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     trans_count++;
     size_t n = qemu_plugin_tb_n_insns(tb);
 
+    uint64_t last_cond_nond_vaddr = 0;
+    uint8_t  prev_stall_rd        = 0;   /* Rd of previous stall-source insn */
+    uint8_t  last_stall_rd        = 0;   /* final value → cross-TB state */
+    uint32_t first_insn_reads     = 0;   /* reads mask of first real insn */
+    bool     first_real_seen      = false;
+
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         const uint8_t *data = insn_bytes(insn);
 
         if (!data) {
-            /* No bytes available: 1-cycle unknown. */
-            if (model_stalls) {
-                uintptr_t meta = (0x3Fu) | (1u << 23) | ((uintptr_t)1u << 24);
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_insn_exec_stall,
-                    QEMU_PLUGIN_CB_NO_REGS, (void *)meta);
-            } else {
-                qemu_plugin_register_vcpu_insn_exec_inline(
-                    insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.insns, 1);
-                qemu_plugin_register_vcpu_insn_exec_inline(
-                    insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.wcycles, 1);
-            }
+            prev_stall_rd = 0;
+            qemu_plugin_register_vcpu_insn_exec_inline(
+                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.insns, 1);
+            qemu_plugin_register_vcpu_insn_exec_inline(
+                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.wcycles, 1);
             continue;
         }
 
         uint32_t w  = insn_word32(data);
         uint8_t  op = (w >> 26) & 0x3F;
 
-        /* ---- Bench control magic NOPs ---- */
         if (is_bench_magic(w)) {
-            /* Magic instructions are hardware NOPs: zero pipeline cost,
-             * not counted in insns/cycles.  Only the event fires.       */
+            prev_stall_rd = 0;   /* magic NOP breaks the stall chain */
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, vcpu_insn_exec_bench,
                 QEMU_PLUGIN_CB_NO_REGS, (void *)(uintptr_t)(w & 0xFF));
             continue;
         }
 
-        /* ---- Delay slot quality (look-ahead at next insn in same TB) ---- */
+        /* Capture reads mask of the first real instruction for cross-TB stall. */
+        if (!first_real_seen) {
+            first_insn_reads = insn_reads_mask(w);
+            first_real_seen  = true;
+        }
+
+        /* Static load-use stall: previous insn wrote a register we read. */
+        if (prev_stall_rd && insn_reads_reg(w, prev_stall_rd))
+            qemu_plugin_register_vcpu_insn_exec_inline(
+                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.scycles, 1);
+
+        /* Update stall-source state for next iteration. */
+        prev_stall_rd = stall_source_rd(w);
+        last_stall_rd = prev_stall_rd;
+
         if (is_delayed_branch(w) && i + 1 < n) {
-            struct qemu_plugin_insn *next = qemu_plugin_tb_get_insn(tb, i + 1);
-            const uint8_t *nd = insn_bytes(next);
+            struct qemu_plugin_insn *nxt = qemu_plugin_tb_get_insn(tb, i + 1);
+            const uint8_t *nd = insn_bytes(nxt);
             bool slot_nop = nd && (insn_word32(nd) == MB_NOP_WORD);
             qemu_plugin_register_vcpu_insn_exec_inline(
                 insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.delayed_branch, 1);
@@ -535,62 +638,43 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
         bool is_nop = (w == MB_NOP_WORD);
 
-        /* ---- Per-instruction counters ---- */
-        if (model_stalls) {
-            uint8_t rd    = (w >> 21) & 0x1F;
-            uint8_t ra    = (w >> 16) & 0x1F;
-            uint8_t rb    = (w >> 11) & 0x1F;
-            bool type_b   = (op & 0x08) != 0;
-            bool rd_src   = mb_rd_is_src[op];
+        uint64_t weight;
+        if (op == 0x16)
+            weight = mb_fpu_lat(w);
+        else if (op == 0x24 && (w & 8u))
+            weight = 2;
+        else if (op == 0x26 || op == 0x27 || op == 0x2E || op == 0x2F)
+            weight = mb_branch_cost(w);
+        else
+            weight = mb_weight[op];
 
-            uint8_t base_cyc;
-            if (op == 0x16)
-                base_cyc = mb_fpu_lat(w);
-            else if (op == 0x24 && (w & 8u))
-                base_cyc = 2;          /* WIC: func bit[3]=1 → 2 cycles */
-            else
-                base_cyc = mb_weight[op];
+        /* Track last conditional non-D branch for retroactive accounting. */
+        if (is_cond_branch_op(op) && !is_delayed_branch(w))
+            last_cond_nond_vaddr = qemu_plugin_insn_vaddr(insn);
 
-            uintptr_t meta = (uintptr_t)op
-                           | ((uintptr_t)rd       <<  6)
-                           | ((uintptr_t)ra       << 11)
-                           | ((uintptr_t)rb       << 16)
-                           | ((uintptr_t)type_b   << 21)
-                           | ((uintptr_t)rd_src   << 22)
-                           | ((uintptr_t)1u        << 23)   /* valid */
-                           | ((uintptr_t)base_cyc << 24)
-                           | ((uintptr_t)is_nop   << 32);
+        qemu_plugin_register_vcpu_insn_exec_inline(
+            insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.insns, 1);
+        qemu_plugin_register_vcpu_insn_exec_inline(
+            insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.wcycles, weight);
+        qemu_plugin_register_vcpu_insn_exec_inline(
+            insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.op_count[op], 1);
+        qemu_plugin_register_vcpu_insn_exec_inline(
+            insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.op_cycles[op], weight);
 
-            qemu_plugin_register_vcpu_insn_exec_cb(
-                insn, vcpu_insn_exec_stall,
-                QEMU_PLUGIN_CB_NO_REGS, (void *)meta);
-
-        } else {
-            /* Weighted inline mode. */
-            uint64_t weight;
-            if (op == 0x16)
-                weight = mb_fpu_lat(w);
-            else if (op == 0x24 && (w & 8u))
-                weight = 2;
-            else
-                weight = mb_weight[op];
-
+        uint64_t *cls = is_nop ? &total.nop : op_class_ctr[op];
+        if (cls)
             qemu_plugin_register_vcpu_insn_exec_inline(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.insns, 1);
-            qemu_plugin_register_vcpu_insn_exec_inline(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.wcycles, weight);
-            qemu_plugin_register_vcpu_insn_exec_inline(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.op_count[op], 1);
-            qemu_plugin_register_vcpu_insn_exec_inline(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, &total.op_cycles[op], weight);
-
-            /* Class counter. */
-            uint64_t *cls = is_nop ? &total.nop : op_class_ctr[op];
-            if (cls)
-                qemu_plugin_register_vcpu_insn_exec_inline(
-                    insn, QEMU_PLUGIN_INLINE_ADD_U64, cls, 1);
-        }
+                insn, QEMU_PLUGIN_INLINE_ADD_U64, cls, 1);
     }
+
+    TBBranchMeta *binfo = g_malloc(sizeof(TBBranchMeta));
+    binfo->tb_vaddr        = qemu_plugin_tb_vaddr(tb);
+    binfo->has_cond_branch = last_cond_nond_vaddr != 0;
+    binfo->fallthrough_pc  = last_cond_nond_vaddr + 4;
+    binfo->last_stall_rd   = last_stall_rd;
+    binfo->first_insn_reads = first_insn_reads;
+    qemu_plugin_register_vcpu_tb_exec_cb(
+        tb, vcpu_tb_exec_branch, QEMU_PLUGIN_CB_NO_REGS, (void *)binfo);
 }
 
 /* =========================================================================
