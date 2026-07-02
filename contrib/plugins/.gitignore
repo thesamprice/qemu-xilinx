@@ -1,0 +1,5 @@
+# RTQCov build artifacts (not checked in)
+/libqemu_rtems_cov.so
+__pycache__/
+*.pyc
+*.egg-info/
