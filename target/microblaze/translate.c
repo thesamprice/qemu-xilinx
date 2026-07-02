@@ -372,13 +372,16 @@ static void gen_bsefi(TCGv_i32 out, TCGv_i32 ina, int32_t imm)
     /* Note that decodetree has extracted and reassembled imm_w/imm_s. */
     int imm_w = extract32(imm, 5, 5);
     int imm_s = extract32(imm, 0, 5);
+    /* UG984 §5: imm_w is the end-bit index (inclusive), imm_s is the start
+     * bit.  Width = imm_w - imm_s + 1.  tcg_gen_extract_i32 takes (start, len). */
+    int width = imm_w - imm_s + 1;
 
-    if (imm_w + imm_s > 32 || imm_w == 0) {
+    if (imm_w < imm_s || imm_w >= 32) {
         /* These inputs have an undefined behavior.  */
         qemu_log_mask(LOG_GUEST_ERROR, "bsefi: Bad input w=%d s=%d\n",
                       imm_w, imm_s);
     } else {
-        tcg_gen_extract_i32(out, ina, imm_s, imm_w);
+        tcg_gen_extract_i32(out, ina, imm_s, width);
     }
 }
 
