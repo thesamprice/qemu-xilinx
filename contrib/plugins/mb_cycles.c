@@ -8,19 +8,15 @@
  * The goal is a reproducible measurement so that compiler changes produce clear
  * before/after diffs.
  *
- * TWO MEASUREMENT MODES
- * ---------------------
- * weighted  (stalls=off, default):
- *   Counts weighted instruction cycles from a fixed UG984 §5 table.  No stalls,
- *   no memory effects, no branch penalties.  Use as the primary regression baseline.
- *
- * raw-stalls  (stalls=on):
- *   Adds in-order RAW forwarding stalls on top of weighted cycles.  Tracks
- *   register readiness for all 32 GPRs.  Loads add 1 stall on a direct consumer
- *   (load result latency = 2 cycles, forwarded from MEM stage).  Blocking ops
- *   (idiv=34, FPU=per-func, mts/mfs=2) stall the pipeline for their base cost;
- *   no extra RAW stall after them.  Ignores WAW/WAR hazards, memory hierarchy,
- *   and branch penalties.
+ * MEASUREMENT MODEL
+ * -----------------
+ * Counts weighted instruction cycles from a fixed UG984 §5 table.  Load-use
+ * stalls (1-cycle RAW hazard when a load result is consumed by the immediately
+ * following instruction) are detected statically at TB translation time by
+ * inspecting adjacent instruction pairs — no runtime tracking required.  The
+ * stall penalty is baked in as a constant inline add, so overhead is zero.
+ * Cross-TB load-use stalls (load at end of TB[N], consumer at start of TB[N+1])
+ * are resolved at TB-exec time via a single lightweight C callback per TB.
  *
  * BENCHMARK CONTROL (magic NOP instructions)
  * ------------------------------------------
@@ -57,7 +53,6 @@
  *   opt=FLAGS         optimisation flags  (default: "")
  *   target=CONFIG     target configuration  (default: "")
  *   commit=HASH       compiler commit hash  (default: "")
- *   stalls=on|off     enable RAW stall model  (default: off)
  *   area_opt=0|1|2    FPU latency variant  (default: 0)
  *   verbose=on|off    per-opcode breakdown appended to JSON  (default: off)
  *
@@ -257,14 +252,11 @@ static uint8_t g_cross_tb_stall_rd;   /* 0 = no pending cross-TB stall */
  * When a non-D conditional branch ends a TB we cannot know at translation
  * time whether it will be taken.  We save the fallthrough PC here; at the
  * start of the NEXT TB's exec callback, if next_tb_vaddr != fallthrough_pc
- * the branch was taken and we add 2 extra cycles to total.wcycles.
+ * the branch was taken → add 2 extra cycles.  Not-taken → 1 cycle total;
+ * taken → 3 cycles total.
  * ========================================================================= */
-typedef struct {
-    bool     valid;
-    uint64_t fallthrough_pc;
-} PendingBranch;
-
-static PendingBranch g_pending_branch;
+static bool     g_pending_branch_valid;
+static uint64_t g_pending_branch_fallthrough;
 
 /* =========================================================================
  * Plugin configuration
@@ -314,22 +306,31 @@ static inline bool is_bench_magic(uint32_t w)
 /*
  * Return true if this is a delayed-branch (D-form) opcode.
  *
- * Encoding verified against insns.decode:
- *   0x26 (br/brd/brald):  Ra-field bits[20:16] encode D/A/L; D = bit 20
- *   0x27 (beq/beqd etc.): Rd-field bits[25:21] encode cond+D; D = bit 25 (MSB of rD)
- *   0x2D (rtsd etc.):     always has a delay slot
- *   0x2E (bri/brid etc.): same layout as 0x26; D = bit 20
- *   0x2F (beqi/beqid):    same layout as 0x27; D = bit 25 (MSB of rD)
+ * 0x26 (br* reg):   rA field encodes {D,A,L,0,0}; D = bit 20 (rA[4]).
+ *                   This applies to ALL 0x26 variants including link (brld/brald),
+ *                   because even link branches store the link register in rD and
+ *                   put the modifier flags in rA.
+ *
+ * 0x27 (beq* reg):  rD field encodes {D, cond[3:0]}; D = bit 25 (rD[4]).
+ *
+ * 0x2D (rtsd etc.): always D-form; no flag needed.
+ *
+ * 0x2E (bri* imm):  ALL forms (bri/brai/brid/braid/brlid/bralid) encode {D,A,L}
+ *                   in rA[20:16]; D = bit 20 (rA[4]).  rD is either the link
+ *                   register (brlid/bralid) or 0 (non-link forms).
+ *                   Verified against QEMU insns.decode and GNU AS output.
+ *
+ * 0x2F (beqi* imm): same layout as 0x27; D = bit 25 (rD[4]).
  */
 static inline bool is_delayed_branch(uint32_t w)
 {
     uint8_t op = (w >> 26) & 0x3F;
     switch (op) {
-    case 0x26: return (w >> 20) & 1;   /* brd/brad/brld/brald: D at bit 20 */
-    case 0x27: return (w >> 25) & 1;   /* beqd-bged: D at bit 25 (MSB of rD) */
-    case 0x2D: return true;            /* rtsd/rtid/rtbd/rted: always       */
-    case 0x2E: return (w >> 20) & 1;   /* brid/braid/brlid/bralid: D at 20 */
-    case 0x2F: return (w >> 25) & 1;   /* beqid-bgeid: D at bit 25 (MSB of rD) */
+    case 0x26: return (w >> 20) & 1;           /* D in rA[4] */
+    case 0x27: return (w >> 25) & 1;           /* D in rD[4] */
+    case 0x2D: return true;                    /* always D-form */
+    case 0x2E: return (w >> 20) & 1;           /* D in rA[4] for ALL 0x2E forms */
+    case 0x2F: return (w >> 25) & 1;           /* D in rD[4] */
     default:   return false;
     }
 }
@@ -395,10 +396,9 @@ static inline uint32_t insn_reads_mask(uint32_t w)
  * taken → cost = 3 (1 branch + 2-cycle flush).
  *
  * Non-D conditional (bnei, beqi, blti, …): static cost = 1.  An extra 2
- * cycles is credited retroactively when the next TB's start address does not
- * equal this branch's fallthrough PC (i.e. it was taken).  Not-taken → 1
- * cycle total; taken → 3 cycles total.  Accounting is done in
- * vcpu_tb_exec_branch (stalls=off) / vcpu_tb_exec_stall (stalls=on).
+ * cycles is added retroactively at the start of the next TB when the next
+ * TB's vaddr != this branch's fallthrough PC (i.e. the branch was taken).
+ * Not-taken → 1 cycle total; taken → 3 cycles total.
  */
 static inline uint8_t mb_branch_cost(uint32_t w)
 {
@@ -409,10 +409,6 @@ static inline uint8_t mb_branch_cost(uint32_t w)
     return 3;       /* unconditional non-D: always taken, 3-cycle flush */
 }
 
-static inline uint64_t stall_for(uint8_t r, uint64_t now)
-{
-    return (r && reg_ready[r] > now) ? reg_ready[r] - now : 0;
-}
 
 /* =========================================================================
  * Bench state machine operations
@@ -463,7 +459,7 @@ static void emit_json(const MBCounts *c, const char *status)
     A("  \"target_config\": \"%s\",\n", target_config);
     A("  \"compiler_commit\": \"%s\",\n", commit_hash);
     A("  \"status\": \"%s\",\n",        status);
-    A("  \"stall_model\": \"%s\",\n",   model_stalls ? "raw-stalls" : "weighted");
+    A("  \"stall_model\": \"static\",\n");
     A("  \"instructions\": %" PRIu64 ",\n",      c->insns);
     A("  \"weighted_cycles\": %" PRIu64 ",\n",   c->wcycles);
     A("  \"raw_stall_cycles\": %" PRIu64 ",\n",  c->scycles);
@@ -534,35 +530,44 @@ static void vcpu_insn_exec_bench(unsigned int vcpu_idx, void *userdata)
 
 /* =========================================================================
  * TB-exec callback — branch accounting and cross-TB stall resolution
+ *
+ * One callback per TB execution.  Computed at translation time; all fields
+ * are constant for the lifetime of the translated block.  g_malloc is called
+ * once per unique TB (translation), not per execution.
  * ========================================================================= */
 typedef struct {
-    uint64_t tb_vaddr;
-    bool     has_cond_branch;
-    uint64_t fallthrough_pc;
-    uint8_t  last_stall_rd;     /* Rd of last stall-source insn in TB (0 = none) */
-    uint32_t first_insn_reads;  /* bitmask of GPRs read by TB's first real insn */
-} TBBranchMeta;
+    uint64_t tb_vaddr;         /* for retroactive branch comparison */
+    uint64_t fallthrough_pc;   /* PC after the conditional non-D branch */
+    uint32_t first_insn_reads; /* GPR read bitmask of TB's first real insn */
+    uint8_t  last_stall_rd;    /* Rd of last stall-source insn (0 = none) */
+    bool     has_cond_branch;  /* TB ends with a non-D conditional branch */
+} TBMeta;
 
-static void vcpu_tb_exec_branch(unsigned int vcpu_idx, void *userdata)
+static void vcpu_tb_exec_cb(unsigned int vcpu_idx, void *userdata)
 {
-    const TBBranchMeta *info = (const TBBranchMeta *)userdata;
+    const TBMeta *m = (const TBMeta *)userdata;
 
-    /* Cross-TB load-use stall: previous TB ended with a stall-source insn. */
+    /* Fast path: nothing pending in either direction. */
+    if (!g_pending_branch_valid && !g_cross_tb_stall_rd &&
+        !m->has_cond_branch   && !m->last_stall_rd)
+        return;
+
+    /* Cross-TB load-use stall: previous TB ended with a load/mfs. */
     if (g_cross_tb_stall_rd &&
-        (info->first_insn_reads >> g_cross_tb_stall_rd) & 1)
+        (m->first_insn_reads >> g_cross_tb_stall_rd) & 1)
         total.scycles += 1;
-    g_cross_tb_stall_rd = info->last_stall_rd;
+    g_cross_tb_stall_rd = m->last_stall_rd;
 
     /* Retroactive branch-taken credit. */
-    if (g_pending_branch.valid) {
-        if (info->tb_vaddr != g_pending_branch.fallthrough_pc)
+    if (g_pending_branch_valid) {
+        if (m->tb_vaddr != g_pending_branch_fallthrough)
             total.wcycles += 2;   /* taken: 1 static + 2 extra = 3 total */
-        g_pending_branch.valid = false;
+        g_pending_branch_valid = false;
     }
 
-    if (info->has_cond_branch) {
-        g_pending_branch.valid          = true;
-        g_pending_branch.fallthrough_pc = info->fallthrough_pc;
+    if (m->has_cond_branch) {
+        g_pending_branch_valid      = true;
+        g_pending_branch_fallthrough = m->fallthrough_pc;
     }
 }
 
@@ -572,18 +577,19 @@ static void vcpu_tb_exec_branch(unsigned int vcpu_idx, void *userdata)
  * One path only: inline counter updates per instruction.  Load-use stalls
  * are detected statically by looking at adjacent instruction pairs; the
  * stall penalty is baked in as a constant inline add at translation time.
- * Branch taken/not-taken and cross-TB stall resolution are handled by one
- * lightweight C callback per TB (vcpu_tb_exec_branch).
+ * Cross-TB stall resolution and retroactive branch-taken accounting are
+ * handled by one lightweight C callback per TB (vcpu_tb_exec_cb); its
+ * fast-path exit makes it near-zero cost when no state is pending.
  * ========================================================================= */
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     trans_count++;
     size_t n = qemu_plugin_tb_n_insns(tb);
 
-    uint64_t last_cond_nond_vaddr = 0;
-    uint8_t  prev_stall_rd        = 0;   /* Rd of previous stall-source insn */
-    uint8_t  last_stall_rd        = 0;   /* final value → cross-TB state */
-    uint32_t first_insn_reads     = 0;   /* reads mask of first real insn */
+    uint64_t last_cond_nond_vaddr = 0;  /* vaddr of last non-D conditional branch */
+    uint8_t  prev_stall_rd        = 0;  /* Rd of previous stall-source insn */
+    uint8_t  last_stall_rd        = 0;  /* final value → cross-TB state */
+    uint32_t first_insn_reads     = 0;  /* reads mask of first real insn */
     bool     first_real_seen      = false;
 
     for (size_t i = 0; i < n; i++) {
@@ -667,14 +673,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 insn, QEMU_PLUGIN_INLINE_ADD_U64, cls, 1);
     }
 
-    TBBranchMeta *binfo = g_malloc(sizeof(TBBranchMeta));
-    binfo->tb_vaddr        = qemu_plugin_tb_vaddr(tb);
-    binfo->has_cond_branch = last_cond_nond_vaddr != 0;
-    binfo->fallthrough_pc  = last_cond_nond_vaddr + 4;
-    binfo->last_stall_rd   = last_stall_rd;
-    binfo->first_insn_reads = first_insn_reads;
+    TBMeta *m = g_malloc(sizeof(TBMeta));
+    m->tb_vaddr        = qemu_plugin_tb_vaddr(tb);
+    m->has_cond_branch = last_cond_nond_vaddr != 0;
+    m->fallthrough_pc  = last_cond_nond_vaddr + 4;
+    m->last_stall_rd   = last_stall_rd;
+    m->first_insn_reads = first_insn_reads;
     qemu_plugin_register_vcpu_tb_exec_cb(
-        tb, vcpu_tb_exec_branch, QEMU_PLUGIN_CB_NO_REGS, (void *)binfo);
+        tb, vcpu_tb_exec_cb, QEMU_PLUGIN_CB_NO_REGS, (void *)m);
 }
 
 /* =========================================================================
@@ -711,7 +717,6 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                     !g_strcmp0(v,"true") || !g_strcmp0(v,"1"); \
             continue; \
         }
-        BOOL_ARG("stalls",  model_stalls)
         BOOL_ARG("verbose", verbose)
 #undef BOOL_ARG
 
